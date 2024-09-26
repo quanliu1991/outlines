@@ -2,7 +2,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Protocol, Tuple, Union
 
 import interegular
+import torch
 from lark import Lark
+from collections import defaultdict
 
 from outlines import grammars
 from outlines.caching import cache
@@ -28,7 +30,7 @@ class Write:
 
     """
 
-    tokens: List[int]
+    tokens: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -42,7 +44,7 @@ class Generate:
         of ``None`` indicates that all tokens are allowed.
     """
 
-    tokens: Optional[List[int]]
+    tokens: torch.Tensor
 
 
 Instruction = Union[Write, Generate]
@@ -107,7 +109,7 @@ class StopAtEOSGuide(Guide):
 
 @cache()
 def create_states_mapping(
-    regex_string: str, tokenizer: "Tokenizer"
+        regex_string: str, tokenizer: "Tokenizer"
 ) -> Tuple[dict, set, set]:
     """Create the variables related to the mapping between states and tokens
     The parameters of the function are used for caching purpose
@@ -123,7 +125,7 @@ def create_states_mapping(
     # of the regular expression with the tokens present in the model's
     # vocabulary.
     if not any(
-        regex_fsm.finals.intersection(v.values()) for v in states_to_token_maps.values()
+            regex_fsm.finals.intersection(v.values()) for v in states_to_token_maps.values()
     ):
         raise ValueError(
             "The vocabulary does not allow us to build a sequence that matches the input regex"
@@ -137,7 +139,7 @@ class RegexGuide(Guide):
 
     initial_state = 0
 
-    def __init__(self, regex_string: str, tokenizer):
+    def __init__(self, regex_string: str, tokenizer: "Tokenizer", mode="comp"):
         (
             self.states_to_token_maps,
             self.empty_token_ids,
@@ -145,6 +147,12 @@ class RegexGuide(Guide):
         ) = create_states_mapping(regex_string, tokenizer)
         self.eos_token_id = tokenizer.eos_token_id
         self.final_states = fsm_finals | {-1}
+        self.mode = mode
+
+        if self.mode == "comp":
+            self._compress_fsm()
+        else:
+            self._cache_state_to_token_tensor()
 
     def get_next_instruction(self, state: int) -> Instruction:
         """Return the next instruction for guided generation.
@@ -169,11 +177,20 @@ class RegexGuide(Guide):
         A `Generate` instance that contains the model and the allowed token ids.
 
         """
-        next_tokens_to_end_states = self.states_to_token_maps.get(state)
-        if next_tokens_to_end_states is None:
-            return Write([self.eos_token_id])
+        if self.mode == "comp":
+            next_tensor_ids = self.states_to_token_maps.get(state)
+            if next_tensor_ids is None:
+                next_tokens_mask = None
+            else:
+                next_tokens_mask = torch.cat([self.token_tensor_maps.get(tensor_id) for tensor_id in next_tensor_ids],
+                                             dim=0)
+        else:
+            next_tokens_mask = self.states_to_token_mask.get(state)
 
-        return Generate(list(next_tokens_to_end_states.keys()))
+        if next_tokens_mask is None:
+            return Write(torch.tensor([self.eos_token_id]))
+
+        return Generate(next_tokens_mask)
 
     def get_next_state(self, state: int, token_id: int) -> int:
         """Update the state of the guide.
@@ -196,21 +213,35 @@ class RegexGuide(Guide):
         if token_id == self.eos_token_id or state not in self.states_to_token_maps:
             return -1
 
+        if self.mode == "comp":
+            last_token_to_end_state = self.states_to_token_maps[state]
+            next_state = None
+
+            for i in last_token_to_end_state:
+                if token_id in self.token_tensor_maps[str(i)]:
+                    tensor_id = str(i)
+                    next_state = self.path_maps[tensor_id].get(state)
+                    break
+
+            if next_state is None:
+                next_state = self.final_state
+            return next_state
+
         last_token_to_end_state = self.states_to_token_maps[state]
         next_state = last_token_to_end_state.get(token_id)
         if next_state is None:
-            next_state = -1
+            return self.final_state
 
         return next_state
 
     @classmethod
     def from_interegular_fsm(
-        cls, interegular_fsm: interegular.fsm.FSM, tokenizer: "Tokenizer"
+            cls, interegular_fsm: interegular.fsm.FSM, tokenizer: "Tokenizer"
     ):
         from_interegular_instance = cls.__new__(cls)
 
         def create_states_mapping_from_interegular_fsm(
-            fsm: interegular.fsm.FSM,
+                fsm: interegular.fsm.FSM,
         ) -> Tuple[dict, set]:
             """Create the variables related to the mapping between states and tokens
             The parameters of the function are used for caching purpose
@@ -225,8 +256,8 @@ class RegexGuide(Guide):
             # of the regular expression with the tokens present in the model's
             # vocabulary.
             if not any(
-                regex_fsm.finals.intersection(v.values())
-                for v in states_to_token_maps.values()
+                    regex_fsm.finals.intersection(v.values())
+                    for v in states_to_token_maps.values()
             ):
                 raise ValueError(
                     "The vocabulary does not allow us to build a sequence that matches the input regex"
@@ -239,7 +270,52 @@ class RegexGuide(Guide):
             from_interegular_instance.empty_token_ids,
         ) = create_states_mapping_from_interegular_fsm(interegular_fsm)
         from_interegular_instance.eos_token_id = tokenizer.eos_token_id
+        from_interegular_instance._cache_state_to_token_tensor()
         return from_interegular_instance
+
+    def _cache_state_to_token_tensor(self):
+        """
+        cache state -> token int tensor
+        this increases performance of mask construction substantially
+        """
+        self.states_to_token_mask = {
+            state: torch.tensor(list(next_tokens_to_end_states.keys()))
+            for state, next_tokens_to_end_states in self.states_to_token_maps.items()
+        }
+
+    def _compress_fsm(self):
+        # same next state tokens as tokens_set eg:{"0->1":[1,2,3,4],"0->2":[56,67,78,65]}
+        # form state0 to state1 have  [1,2,3,4] tokens_set.
+        state_state_to_edge = defaultdict(list)
+        for in_state, token_to_states in self.states_to_token_maps.items():
+            for token, out_state in token_to_states.items():
+                state_state_to_edge[str(in_state) + "->" + str(out_state)].append(token)
+
+        # same tokens_set to state transfer eg:{(1,2,3,4):,["3->6","0->2"]} (1,2,3,4)
+        # tokens_set have [form state0 to state2] and  [form state3 to state6] .
+        edge_to_state_state = {}
+        for k, v in state_state_to_edge.items():
+            sorted_token = tuple(sorted(v))
+            if sorted_token in edge_to_state_state.keys():
+                edge_to_state_state[sorted_token].append(k)
+            else:
+                edge_to_state_state[sorted_token] = [k]
+
+        # token_tensor_maps:{tokens_set_id: tensor(tokens_set)}, each tokens_set corresponds to an id.
+        # path_maps: {tokens_set_id: {statex:statey}}，tokens_set_id corresponds status change
+        # states_to_token_maps: {state:[tokens_set_ids]}, each state contains tokens_sets.
+        self.token_tensor_maps = defaultdict()
+        self.path_maps = defaultdict(dict)
+        for i, (k, v) in enumerate(edge_to_state_state.items()):
+            self.token_tensor_maps[str(i)] = torch.tensor(list(k))
+            for path in v:
+                in_state, out_state = path.split("->")[0], path.split("->")[1]
+                self.path_maps[str(i)][int(in_state)] = int(out_state)
+
+                if isinstance(self.states_to_token_maps[int(in_state)], list):
+                    self.states_to_token_maps[int(in_state)].append(str(i))
+                else:
+                    self.states_to_token_maps[int(in_state)] = [str(i)]
 
     def is_final_state(self, state: int) -> bool:
         """Determine whether the current state of the guide is a final state."""
