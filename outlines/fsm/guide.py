@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Protocol, Tuple, Union
 
@@ -13,9 +14,20 @@ from outlines.fsm.regex import (
     make_byte_level_fsm,
     make_deterministic_fsm,
 )
+import dataclasses
+from collections import defaultdict
+
 
 if TYPE_CHECKING:
     from outlines.models.tokenizer import Tokenizer
+
+@dataclasses.dataclass
+class JumpEdge:
+    symbol: str = None
+    symbol_next_state: int = None
+    byte: int = None
+    byte_next_state: int = None
+
 
 
 @dataclass(frozen=True)
@@ -110,7 +122,7 @@ class StopAtEOSGuide(Guide):
 @cache()
 def create_states_mapping(
         regex_string: str, tokenizer: "Tokenizer"
-) -> Tuple[dict, set, set]:
+) -> Tuple[dict, set, set, dict]:
     """Create the variables related to the mapping between states and tokens
     The parameters of the function are used for caching purpose
     """
@@ -131,7 +143,14 @@ def create_states_mapping(
             "The vocabulary does not allow us to build a sequence that matches the input regex"
         )
 
-    return states_to_token_maps, empty_token_ids, regex_fsm.finals
+    try:  # FIXME(liuquan) regex_fsm.fsm_info.alphabet_symbol_mapping  can not (for)
+        state_to_leap_forward = self._init_state_to_leap_forward(regex_fsm)
+        logging.info(f"{regex_string} state_to_leap_forward is created")
+    except:
+        logging.warning(f"{regex_string} state_to_leap_forward failed to create")
+        state_to_leap_forward = {}
+
+    return states_to_token_maps, empty_token_ids, regex_fsm.finals, state_to_leap_forward
 
 
 class RegexGuide(Guide):
@@ -144,6 +163,7 @@ class RegexGuide(Guide):
             self.states_to_token_maps,
             self.empty_token_ids,
             fsm_finals,
+            self.state_to_leap_forward,
         ) = create_states_mapping(regex_string, tokenizer)
         self.eos_token_id = tokenizer.eos_token_id
         self.final_states = fsm_finals | {-1}
@@ -316,6 +336,76 @@ class RegexGuide(Guide):
                     self.states_to_token_maps[int(in_state)].append(str(i))
                 else:
                     self.states_to_token_maps[int(in_state)] = [str(i)]
+
+    def _init_state_to_leap_forward(self, regex_fsm):
+        fsm_info = regex_fsm.fsm_info
+
+        symbol_to_id = fsm_info.alphabet_symbol_mapping
+        id_to_symbol = {}
+        for symbol, id_ in symbol_to_id.items():
+            id_to_symbol.setdefault(id_, []).append(symbol)
+
+        transitions = fsm_info.transitions
+
+        outgoings_ct = defaultdict(int)
+        # NOTE(lsyin): Final states can lead to terminate, so they have one outgoing edge naturally
+        for s in fsm_info.finals:
+            outgoings_ct[s] = 1
+
+        state_to_leap_forward = {}
+        for (state, id_), next_state in transitions.items():
+            if id_ == fsm_info.alphabet_anything_value:
+                # Arbitrarily symbol cannot be recognized as jump forward
+                continue
+
+            symbols = id_to_symbol[id_]
+            for c in symbols:
+                if len(c) > 1:
+                    # Skip byte level transitions like c = "5E"
+                    continue
+
+                outgoings_ct[state] += 1
+                if outgoings_ct[state] > 1:
+                    if state in state_to_leap_forward:
+                        del state_to_leap_forward[state]
+                    break
+
+                state_to_leap_forward[state] = JumpEdge(
+                    symbol=c,
+                    symbol_next_state=next_state,
+                )
+
+        # Process the byte level jump forward
+        outgoings_ct = defaultdict(int)
+        for s in fsm_info.finals:
+            outgoings_ct[s] = 1
+
+        for (state, id_), next_state in transitions.items():
+            if id_ == fsm_info.alphabet_anything_value:
+                continue
+            symbols = id_to_symbol[id_]
+            for c in symbols:
+                byte_ = None
+                if len(c) == 1 and ord(c) < 0x80:
+                    # ASCII character
+                    byte_ = ord(c)
+                elif len(c) > 1:
+                    # FIXME: This logic is due to the leading \x00
+                    # https://github.com/outlines-dev/outlines/pull/930
+                    byte_ = int(symbols[0][1:], 16)
+
+                if byte_ is not None:
+                    outgoings_ct[state] += 1
+                    if outgoings_ct[state] > 1:
+                        if state in state_to_leap_forward:
+                            del state_to_leap_forward[state]
+                        break
+                    e = state_to_leap_forward.get(state, JumpEdge())
+                    e.byte = byte_
+                    e.byte_next_state = next_state
+                    state_to_leap_forward[state] = e
+
+        return state_to_leap_forward
 
     def is_final_state(self, state: int) -> bool:
         """Determine whether the current state of the guide is a final state."""
